@@ -3942,23 +3942,29 @@ fn tool_text(parsed: Option<&Value>, stdout: &str, stderr: &str) -> String {
             // Render changed summaries once, through the same untrusted formatter as
             // CLI text, including when the primary result falls back to JSON.
             let mut primary = value.clone();
-            if let Some(data) = primary.get_mut("data").and_then(Value::as_object_mut) {
-                data.remove("webmcp");
-            }
+            let contexts: Vec<String> = if let Some(results) = primary.as_array_mut() {
+                // Batch commands store each response's data under `result`.
+                results
+                    .iter_mut()
+                    .enumerate()
+                    .filter_map(|(index, result)| {
+                        let context = take_webmcp_context(result.get_mut("result")?)?;
+                        Some(format!("Batch result {}:\n{}", index + 1, context))
+                    })
+                    .collect()
+            } else {
+                primary
+                    .get_mut("data")
+                    .and_then(take_webmcp_context)
+                    .into_iter()
+                    .collect()
+            };
             let mut text = response_text(&primary).unwrap_or_else(|| {
                 serde_json::to_string_pretty(&primary).unwrap_or_else(|_| stdout.trim().to_string())
             });
             // Most hosts put text content in the model context; preserving
             // metadata only in structuredContent is not sufficient.
-            if let Some(context) = value.get("data").and_then(|data| {
-                crate::output::format_webmcp_context(
-                    data,
-                    &crate::output::OutputOptions {
-                        content_boundaries: true,
-                        ..Default::default()
-                    },
-                )
-            }) {
+            for context in contexts {
                 text.push_str("\n\n");
                 text.push_str(&context);
             }
@@ -3980,6 +3986,20 @@ fn tool_text(parsed: Option<&Value>, stdout: &str, stderr: &str) -> String {
     } else {
         text
     }
+}
+
+fn take_webmcp_context(data: &mut Value) -> Option<String> {
+    let context = crate::output::format_webmcp_context(
+        data,
+        &crate::output::OutputOptions {
+            content_boundaries: true,
+            ..Default::default()
+        },
+    );
+    if let Some(data) = data.as_object_mut() {
+        data.remove("webmcp");
+    }
+    context
 }
 
 fn response_text(value: &Value) -> Option<String> {
@@ -4871,6 +4891,107 @@ mod tests {
                 assert_eq!(result["isError"], !success);
             }
         }
+    }
+
+    #[test]
+    fn ordinary_mcp_batch_response_has_no_webmcp_context() {
+        let response = json!([
+            {"command": ["open", "https://example.com"], "success": true,
+             "result": {"title": "Ordinary page"}, "error": null},
+            {"command": ["snapshot"], "success": true,
+             "result": {"snapshot": "- button Search"}, "error": null}
+        ]);
+        let result = tool_result_from_run(CliRun {
+            exit_code: Some(0),
+            stdout: response.to_string(),
+            stderr: String::new(),
+        });
+        assert_eq!(
+            result["content"][0]["text"],
+            serde_json::to_string_pretty(&response).unwrap()
+        );
+        assert_eq!(result["structuredContent"]["response"], response);
+        assert_eq!(result["isError"], false);
+    }
+
+    #[test]
+    fn tool_result_formats_webmcp_context_for_each_batch_result() {
+        let response = json!([
+            {"command": ["open", "https://example.com"], "success": true,
+             "result": {"title": "Shop", "webmcp": {
+                 "status": "ready", "toolCount": 1, "tools": [{
+                     "name": "search", "description": "Search products", "frameId": "main",
+                     "origin": "https://example.com", "inputSchema": {"type": "object"}
+                 }]
+             }}, "error": null},
+            {"command": ["click", "#missing"], "success": false,
+             "result": {"webmcp": {
+                 "status": "ready", "toolCount": 1, "tools": [{
+                     "name": "checkout", "description": "Complete purchase", "frameId": "main",
+                     "origin": "https://example.com"
+                 }]
+             }}, "error": "controlled failure"}
+        ]);
+        let result = tool_result_from_run(CliRun {
+            exit_code: Some(1),
+            stdout: response.to_string(),
+            stderr: String::new(),
+        });
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let first_context = text.find("Batch result 1:\n").unwrap();
+        let second_context = text.find("Batch result 2:\n").unwrap();
+        assert!(first_context < second_context);
+        for (context, description) in [
+            (&text[first_context..second_context], "Search products"),
+            (&text[second_context..], "Complete purchase"),
+        ] {
+            let start = context
+                .find("--- AGENT_BROWSER_PAGE_CONTENT nonce=")
+                .unwrap();
+            let end = context
+                .find("--- END_AGENT_BROWSER_PAGE_CONTENT nonce=")
+                .unwrap();
+            assert!(context[start..end].contains(description));
+            assert!(context.contains("Untrusted website data"));
+            assert!(context.contains("agent-browser webmcp list <tool>"));
+            assert_eq!(text.matches(description).count(), 1);
+        }
+        assert!(text.contains("Shop"));
+        assert!(text.contains("controlled failure"));
+        assert!(!text.contains("\"webmcp\""));
+        assert!(!text.contains("inputSchema"));
+        assert_eq!(result["structuredContent"]["response"], response);
+        assert_eq!(result["structuredContent"]["stdout"], response.to_string());
+        assert_eq!(result["isError"], true);
+    }
+
+    #[test]
+    fn tool_result_formats_batch_webmcp_state_updates_in_order() {
+        let response = json!([
+            {"command": ["click", "#clear"], "success": true,
+             "result": {"clicked": true, "webmcp": {"status": "ready", "toolCount": 0, "tools": []}}},
+            {"command": ["snapshot"], "success": false,
+             "result": {"webmcp": {"status": "unavailable"}}, "error": "controlled failure"},
+            {"command": ["unknown"], "success": false, "error": "Unknown command"},
+            {"command": ["close"], "success": true, "result": null}
+        ]);
+        let result = tool_result_from_run(CliRun {
+            exit_code: Some(1),
+            stdout: response.to_string(),
+            stderr: String::new(),
+        });
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Batch result 1:\nWebMCP tools cleared"));
+        assert!(text.contains("Batch result 2:\nWebMCP state unavailable"));
+        assert!(
+            text.find("WebMCP tools cleared").unwrap()
+                < text.find("WebMCP state unavailable").unwrap()
+        );
+        assert!(!text.contains("Batch result 3:"));
+        assert!(!text.contains("Batch result 4:"));
+        assert!(!text.contains("\"webmcp\""));
+        assert_eq!(result["structuredContent"]["response"], response);
+        assert_eq!(result["isError"], true);
     }
 
     #[test]

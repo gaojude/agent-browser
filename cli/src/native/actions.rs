@@ -5228,25 +5228,18 @@ async fn handle_navigate(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     navigate_active_page(state, url, wait_until).await
 }
 
-/// Navigate the active page and drop the state that belonged to the document
-/// being replaced: element refs, frame scope, and WebMCP page state. Every
+/// Navigate the active page and drop element refs and frame scope. Every
 /// command that replaces the active document must go through here, or a
-/// stale `@e3` from the previous page keeps resolving.
+/// stale `@e3` from the previous page keeps resolving. WebMCP page state is
+/// invalidated by `Page.frameNavigated` only when the document is replaced.
 async fn navigate_active_page(
     state: &mut DaemonState,
     url: &str,
     wait_until: WaitUntil,
 ) -> Result<Value, String> {
-    if let Some(session_id) = state
-        .browser
-        .as_ref()
-        .and_then(|browser| browser.active_session_id().ok())
-        .map(ToString::to_string)
-    {
-        state.webmcp.clear_page_scope(&session_id);
-    } else {
-        state.webmcp.clear_invocations();
-    }
+    // Same-document navigation retains registered tools and pending calls.
+    // Subscribe before navigating, then let the ordered frameNavigated and
+    // toolsAdded events invalidate and repopulate state for a new document.
     let _ = enable_webmcp_events(state).await;
 
     // With one tab, every tracked iframe belongs to the page being replaced.
